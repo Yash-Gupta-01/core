@@ -16,7 +16,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionToken
-import com.google.common.util.concurrent.MoreExecutors
+import com.google.common.util.concurrent.ListenableFuture
 import com.maxrave.common.MEDIA_NOTIFICATION
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
 import com.maxrave.logger.Logger
@@ -24,7 +24,6 @@ import com.maxrave.media3.R
 import com.maxrave.media3.extension.toCommandButton
 import com.maxrave.media3.utils.CoilBitmapLoader
 import com.maxrave.media3.utils.sizeLimitedForSession
-import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import org.koin.core.qualifier.named
@@ -40,6 +39,7 @@ internal class SimpleMediaService :
     private val coilBitmapLoader: CoilBitmapLoader by inject<CoilBitmapLoader>()
 
     private var mediaSession: MediaLibrarySession? = null
+    private var controllerFuture: ListenableFuture<MediaController>? = null
 
     private val simpleMediaSessionCallback: MediaLibrarySession.Callback by inject<MediaLibrarySession.Callback>()
 
@@ -104,15 +104,7 @@ internal class SimpleMediaService :
         }
 
         val sessionToken = SessionToken(this, ComponentName(this, SimpleMediaService::class.java))
-        val controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
-        controllerFuture.addListener({ controllerFuture.get() }, MoreExecutors.directExecutor())
-
-        simpleMediaServiceHandler.onUpdateNotification = { list ->
-            val commandButtonList = list.map { it.toCommandButton(this) }
-            mediaSession?.setMediaButtonPreferences(
-                commandButtonList,
-            )
-        }
+        controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
     }
 
     @UnstableApi
@@ -138,31 +130,39 @@ internal class SimpleMediaService :
     @UnstableApi
     fun release() {
         Logger.w("Service", "Starting release process")
-        runBlocking {
-            try {
-                // Release MediaSession (don't release player - CrossfadeExoPlayerAdapter manages it)
-                mediaSession?.run {
-                    this.player.pause()
-                    this.player.playWhenReady = false
-                    // Don't call this.player.release() - CrossfadeExoPlayerAdapter manages player lifecycle
-                    this.release()
-                }
-                // Release handler (contains coroutines and jobs, which also releases the adapter)
-                simpleMediaServiceHandler.release()
-                mediaSession = null
-                Logger.w("Service", "Simple Media Service Released")
-            } catch (e: Exception) {
-                Logger.e("Service", "Error during release")
+        try {
+            mediaSession?.run {
+                this.player.pause()
+                this.player.playWhenReady = false
             }
+            simpleMediaServiceHandler.release()
+        } catch (e: Exception) {
+            Logger.e("Service", "Error during release: ${e.message}")
+        } finally {
+            releaseSession()
+        }
+        Logger.w("Service", "Simple Media Service Released")
+    }
+
+    private fun releaseSession() {
+        try {
+            simpleMediaServiceHandler.onUpdateNotification = {}
+            controllerFuture?.let { MediaController.releaseFuture(it) }
+        } finally {
+            controllerFuture = null
+            mediaSession?.release()
+            mediaSession = null
         }
     }
 
     @UnstableApi
     override fun onDestroy() {
-        super.onDestroy()
         Logger.w("Service", "Simple Media Service Destroyed")
-        if (simpleMediaServiceHandler.shouldReleaseOnTaskRemoved()) {
-            release()
+        try {
+            // The handler is shared across service instances; only dispose this service's session.
+            releaseSession()
+        } finally {
+            super.onDestroy()
         }
     }
 
